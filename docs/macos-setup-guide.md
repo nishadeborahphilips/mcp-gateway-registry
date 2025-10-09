@@ -374,15 +374,9 @@ You should see the Keycloak login page. You can log in with:
 4. Click "Apply & Restart"
 
 ```bash
-# Create necessary directories with proper ownership
-# Note: /opt is not shared with Docker by default on macOS, so we need sudo + chown
-sudo mkdir -p /opt/mcp-gateway/{servers,models,auth_server,secrets/fininfo}
-sudo mkdir -p /opt/ssl /var/log/mcp-gateway
-
-# Change ownership from root to your user so Docker containers can write to these directories
-sudo chown -R $(whoami):$(id -gn) /opt/mcp-gateway
-sudo chown -R $(whoami):$(id -gn) /opt/ssl
-sudo chown -R $(whoami):$(id -gn) /var/log/mcp-gateway
+# Create necessary directories
+# Using ${HOME}/mcp-gateway to avoid needing sudo permissions
+mkdir -p ${HOME}/mcp-gateway/{servers,models,auth_server,secrets/fininfo,logs,ssl}
 
 # Make build script executable
 chmod +x build_and_run.sh
@@ -469,7 +463,7 @@ source .venv/bin/activate
 source .oauth-tokens/agent-test-agent-m2m.env
 
 # Test connectivity
-uv run python mcp_client.py ping
+uv run cli/mcp_client.py ping
 
 # Expected output:
 # ✓ M2M authentication successful
@@ -477,10 +471,10 @@ uv run python mcp_client.py ping
 # {"jsonrpc": "2.0", "id": 2, "result": {}}
 
 # List available tools
-uv run python mcp_client.py list
+uv run cli/mcp_client.py list
 
 # Test a simple tool
-uv run python mcp_client.py --url http://localhost/currenttime/mcp call --tool current_time_by_timezone --args '{"tz_name":"America/New_York"}'
+uv run cli/mcp_client.py --url http://localhost/currenttime/mcp call --tool current_time_by_timezone --args '{"tz_name":"America/New_York"}'
 ```
 
 ### Test Admin Console
@@ -532,10 +526,7 @@ sudo chown -R $(whoami) ~/.docker
 chmod +x keycloak/setup/*.sh
 chmod +x build_and_run.sh
 
-# Fix directory ownership for Docker volumes (macOS specific)
-sudo chown -R $(whoami):$(id -gn) /opt/mcp-gateway
-sudo chown -R $(whoami):$(id -gn) /opt/ssl
-sudo chown -R $(whoami):$(id -gn) /var/log/mcp-gateway
+# No additional ownership fixes needed - all directories are in user space
 ```
 
 #### Keycloak "HTTPS Required" Error

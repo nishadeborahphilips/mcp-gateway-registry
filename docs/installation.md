@@ -52,10 +52,9 @@ open http://localhost:7860
 
 1. **Create Local Directories**
    ```bash
-   sudo mkdir -p /opt/mcp-gateway/{servers,auth_server,secrets}
-   sudo cp -r registry/servers /opt/mcp-gateway/
-   sudo cp auth_server/scopes.yml /opt/mcp-gateway/auth_server/
-   sudo mkdir /var/log/mcp-gateway
+   mkdir -p ${HOME}/mcp-gateway/{servers,auth_server,secrets,logs}
+   cp -r registry/servers ${HOME}/mcp-gateway/
+   cp auth_server/scopes.yml ${HOME}/mcp-gateway/auth_server/
    ```
 
 2. **Configure Environment Variables**
@@ -103,24 +102,87 @@ open http://localhost:7860
 
 ### HTTPS Configuration
 
-For production deployments with SSL:
+By default, MCP Gateway runs on HTTP (port 80). To enable HTTPS for production deployments:
 
-1. **Prepare SSL Certificates**
-   ```bash
-   sudo mkdir -p /home/ubuntu/ssl_data/{certs,private}
-   # Copy certificate files:
-   # - fullchain.pem → /home/ubuntu/ssl_data/certs/
-   # - privkey.pem → /home/ubuntu/ssl_data/private/
-   ```
+#### 1. Obtain SSL Certificates
 
-2. **Configure Security Group**
-   - Enable TCP port 443 for HTTPS access
-   - Restrict access to authorized IP ranges
+**Option A: Let's Encrypt (Recommended)**
+```bash
+# Install certbot
+sudo apt-get update
+sudo apt-get install -y certbot
 
-3. **Deploy with HTTPS**
-   ```bash
-   ./build_and_run.sh  # Automatically detects SSL certificates
-   ```
+# Get certificate (requires domain and port 80 accessible)
+sudo certbot certonly --standalone -d your-domain.com
+```
+
+**Option B: Commercial CA**
+Purchase SSL certificate from a trusted Certificate Authority.
+
+#### 2. Copy Certificates to Expected Location
+
+MCP Gateway expects SSL certificates at `${HOME}/mcp-gateway/ssl/`. The `build_and_run.sh` script will automatically set up the proper directory structure.
+
+```bash
+# Create the ssl directory structure
+mkdir -p ${HOME}/mcp-gateway/ssl/certs
+mkdir -p ${HOME}/mcp-gateway/ssl/private
+
+# Copy your certificates to the expected location
+# Replace paths below with your actual certificate locations
+cp /etc/letsencrypt/live/your-domain/fullchain.pem ${HOME}/mcp-gateway/ssl/certs/fullchain.pem
+cp /etc/letsencrypt/live/your-domain/privkey.pem ${HOME}/mcp-gateway/ssl/private/privkey.pem
+
+# Set proper permissions
+chmod 644 ${HOME}/mcp-gateway/ssl/certs/fullchain.pem
+chmod 600 ${HOME}/mcp-gateway/ssl/private/privkey.pem
+```
+
+**Note**: If SSL certificates are not present at `${HOME}/mcp-gateway/ssl/certs/fullchain.pem` and `${HOME}/mcp-gateway/ssl/private/privkey.pem`, the MCP Gateway will automatically run in HTTP-only mode.
+
+#### 3. Configure Security Group
+
+- Enable TCP port 443 for HTTPS access
+- Restrict access to authorized IP ranges
+- Keep port 80 open for HTTP and Let's Encrypt renewals
+
+#### 4. Deploy and Verify
+
+```bash
+# Start/restart the services
+./build_and_run.sh
+
+# Check logs for SSL certificate detection
+docker compose logs registry | grep -i ssl
+
+# Expected output:
+# "SSL certificates found - HTTPS enabled"
+# "HTTPS server will be available on port 443"
+
+# Test HTTPS access
+curl https://your-domain.com
+```
+
+#### Certificate Renewal (Let's Encrypt)
+
+Let's Encrypt certificates expire after 90 days. Set up automatic renewal:
+
+```bash
+# Add to crontab
+sudo crontab -e
+
+# Add this line (checks twice daily, renews if needed)
+0 0,12 * * * certbot renew --quiet && cp /etc/letsencrypt/live/your-domain/fullchain.pem ${HOME}/mcp-gateway/ssl/certs/fullchain.pem && cp /etc/letsencrypt/live/your-domain/privkey.pem ${HOME}/mcp-gateway/ssl/private/privkey.pem && docker compose restart registry
+```
+
+#### Troubleshooting
+
+**HTTPS not working?**
+- Check certificate files exist: `ls -la ${HOME}/mcp-gateway/ssl/certs/ ${HOME}/mcp-gateway/ssl/private/`
+- Verify certificates are present: `${HOME}/mcp-gateway/ssl/certs/fullchain.pem` and `${HOME}/mcp-gateway/ssl/private/privkey.pem`
+- Check container logs: `docker compose logs registry | grep -i ssl`
+- Verify port 443 is accessible: `sudo netstat -tlnp | grep 443`
+- Ensure certificates are from a trusted CA
 
 ## Installation on Amazon EKS
 

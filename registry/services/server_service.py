@@ -194,13 +194,31 @@ class ServerService:
         self.registered_servers[path] = server_info
         
         logger.info(f"Server '{server_info['server_name']}' ({path}) updated")
-        
+
+        # Update FAISS index with new server information
+        try:
+            from ..search.service import faiss_service
+            import asyncio
+
+            # Check if we're in an async context
+            try:
+                asyncio.get_running_loop()
+                # We're in an async context, schedule the update
+                asyncio.create_task(faiss_service.add_or_update_service(path, server_info, self.is_service_enabled(path)))
+            except RuntimeError:
+                # No event loop running, we're in sync context - skip FAISS update
+                # This will be handled by the caller in async context
+                logger.debug(f"Skipping FAISS update for {path} - no async context available")
+
+        except Exception as e:
+            logger.error(f"Failed to update FAISS index after server update: {e}")
+
         # Regenerate nginx config if this is an enabled service (proxy_pass_url might have changed)
         if self.is_service_enabled(path):
             try:
                 from ..core.nginx_service import nginx_service
                 enabled_servers = {
-                    service_path: self.get_server_info(service_path) 
+                    service_path: self.get_server_info(service_path)
                     for service_path in self.get_enabled_services()
                 }
                 nginx_service.generate_config(enabled_servers)
@@ -208,7 +226,7 @@ class ServerService:
                 logger.info(f"Regenerated nginx config due to server update: {path}")
             except Exception as e:
                 logger.error(f"Failed to regenerate nginx configuration after server update: {e}")
-        
+
         return True
         
     def toggle_service(self, path: str, enabled: bool) -> bool:
@@ -238,8 +256,30 @@ class ServerService:
         return True
         
     def get_server_info(self, path: str) -> Optional[Dict[str, Any]]:
-        """Get server information by path."""
-        return self.registered_servers.get(path)
+        """
+        Get server information by path.
+
+        Handles path normalization to support lookups with or without trailing slashes.
+        If the exact path is not found, tries the alternate form (with/without trailing slash).
+
+        Args:
+            path: The server path to look up
+
+        Returns:
+            Server info dict if found, None otherwise
+        """
+        # Try exact match first
+        server_info = self.registered_servers.get(path)
+        if server_info:
+            return server_info
+
+        # If not found, try alternate form (add or remove trailing slash)
+        if path.endswith('/'):
+            alternate_path = path.rstrip('/')
+        else:
+            alternate_path = path + '/'
+
+        return self.registered_servers.get(alternate_path)
         
     def get_all_servers(self) -> Dict[str, Dict[str, Any]]:
         """Get all registered servers."""
@@ -265,8 +305,8 @@ class ServerService:
         filtered_servers = {}
         for path, server_info in self.registered_servers.items():
             server_name = server_info.get("server_name", "")
-            # Extract technical name from path (remove leading slash)
-            technical_name = path.lstrip('/')
+            # Extract technical name from path (remove leading and trailing slashes)
+            technical_name = path.strip('/')
             logger.info(f"DEBUG: Checking server path='{path}', server_name='{server_name}', technical_name='{technical_name}' against accessible_servers")
             
             # Check if user has access to this server using technical name
@@ -313,9 +353,9 @@ class ServerService:
         server_info = self.get_server_info(path)
         if not server_info:
             return False
-            
-        # Extract technical name from path (remove leading slash)
-        technical_name = path.lstrip('/')
+
+        # Extract technical name from path (remove leading and trailing slashes)
+        technical_name = path.strip('/')
         return technical_name in accessible_servers
 
     def is_service_enabled(self, path: str) -> bool:
@@ -371,6 +411,43 @@ class ServerService:
                 logger.error(f"Failed to regenerate nginx configuration after state reload: {e}")
         else:
             logger.info("No service state changes detected after reload")
+
+
+    def remove_server(self, path: str) -> bool:
+        """Remove a server from the registry and file system."""
+        # Check if server exists
+        if path not in self.registered_servers:
+            logger.error(f"Cannot remove server at path '{path}': not found in registry")
+            return False
+
+        try:
+            # Remove from file system
+            filename = self._path_to_filename(path)
+            file_path = settings.servers_dir / filename
+
+            if file_path.exists():
+                file_path.unlink()
+                logger.info(f"Removed server file: {file_path}")
+            else:
+                logger.warning(f"Server file not found: {file_path}")
+
+            # Remove from in-memory registry
+            server_name = self.registered_servers[path].get('server_name', 'Unknown')
+            del self.registered_servers[path]
+
+            # Remove from service state
+            if path in self.service_state:
+                del self.service_state[path]
+
+            # Persist updated state
+            self.save_service_state()
+
+            logger.info(f"Successfully removed server '{server_name}' from path '{path}'")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to remove server at path '{path}': {e}", exc_info=True)
+            return False
 
 
 # Global service instance
