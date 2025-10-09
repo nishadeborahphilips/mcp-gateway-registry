@@ -1023,6 +1023,11 @@ async def register_service(
     num_stars: Optional[int] = Field(0, description="Number of stars/rating for the server."),
     is_python: Optional[bool] = Field(False, description="Whether the server is implemented in Python."),
     license: Optional[str] = Field("N/A", description="License information for the server."),
+    auth_provider: Optional[str] = Field(None, description="Authentication provider (e.g., 'bedrock-agentcore', 'oauth')."),
+    auth_type: Optional[str] = Field(None, description="Authentication type (e.g., 'oauth', 'none')."),
+    supported_transports: Optional[List[str]] = Field(None, description="List of supported transports (e.g., ['streamable-http'])."),
+    headers: Optional[List[Dict[str, str]]] = Field(None, description="List of header dictionaries to include in requests."),
+    tool_list: Optional[List[Dict[str, Any]]] = Field(None, description="List of tools with their schemas."),
     ctx: Context = None
 ) -> Dict[str, Any]:
     """
@@ -1046,10 +1051,10 @@ async def register_service(
         Exception: If the API call fails.
     """
     endpoint = "/api/internal/register"
-    
+
     # Convert tags list to comma-separated string if it's a list
     tags_str = ",".join(tags) if isinstance(tags, list) and tags is not None else tags
-    
+
     # Create form data to send to the API
     form_data = {
         "name": server_name,  # Use 'name' as expected by the registry API
@@ -1062,9 +1067,25 @@ async def register_service(
         "is_python": is_python,
         "license_str": license  # The registry API uses license_str field name
     }
+
+    # Add optional fields if provided
+    if auth_provider is not None:
+        form_data["auth_provider"] = auth_provider
+    if auth_type is not None:
+        form_data["auth_type"] = auth_type
+    if supported_transports is not None:
+        # Convert list to JSON string for form data
+        form_data["supported_transports"] = json.dumps(supported_transports) if isinstance(supported_transports, list) else supported_transports
+    if headers is not None:
+        # Convert list to JSON string for form data
+        form_data["headers"] = json.dumps(headers) if isinstance(headers, list) else headers
+    if tool_list is not None:
+        # Convert list to JSON string for form data
+        form_data["tool_list_json"] = json.dumps(tool_list) if isinstance(tool_list, list) else tool_list
+
     # Remove None values
     form_data = {k: v for k, v in form_data.items() if v is not None}
-    
+
     # Send as form data instead of JSON
     return await _call_registry_api("POST", endpoint, ctx, data=form_data)
 
@@ -1648,6 +1669,264 @@ async def remove_server_from_scopes_groups(
 
     except Exception as e:
         error_msg = f"Error removing server {server_name} from groups {group_names}: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return {
+            "success": False,
+            "error": error_msg
+        }
+
+
+@mcp.tool()
+async def create_group(
+    group_name: str = Field(..., description="Name of the group to create (e.g., 'mcp-servers-finance/read')"),
+    description: Optional[str] = Field("", description="Optional description for the group"),
+    ctx: Context = None
+) -> Dict[str, Any]:
+    """
+    Create a new group in both Keycloak and scopes.yml.
+
+    This tool creates a new access control group that can be used to manage
+    server permissions. The group is automatically created in both Keycloak
+    (for authentication) and scopes.yml (for authorization).
+
+    Args:
+        group_name: Name of the group (e.g., 'mcp-servers-finance/read')
+        description: Optional description of the group's purpose
+
+    Returns:
+        Dict with success status and creation details
+
+    Example:
+        create_group(
+            group_name="mcp-servers-finance/read",
+            description="Finance team read access"
+        )
+    """
+    logger.info(f"create_group called with group_name={group_name}")
+
+    try:
+        # Get admin credentials
+        registry_admin_user = os.environ.get("REGISTRY_USERNAME", "admin")
+        registry_admin_password = os.environ.get("REGISTRY_PASSWORD")
+
+        if not registry_admin_password:
+            error_msg = "REGISTRY_PASSWORD environment variable not set. Cannot authenticate to internal API."
+            logger.error(error_msg)
+            return {"success": False, "error": error_msg}
+
+        # Prepare the request data
+        form_data = {
+            "group_name": group_name,
+            "description": description
+        }
+
+        # Prepare Basic Auth header
+        import base64
+        credentials = f"{registry_admin_user}:{registry_admin_password}"
+        encoded_credentials = base64.b64encode(credentials.encode()).decode()
+        headers = {
+            "Authorization": f"Basic {encoded_credentials}",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+
+        # Make request to internal API
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{REGISTRY_BASE_URL}/api/internal/create-group",
+                data=form_data,
+                headers=headers,
+                timeout=30.0
+            )
+
+        if response.status_code == 200:
+            result = response.json()
+            logger.info(f"Successfully created group {group_name}")
+            return {
+                "success": True,
+                "message": result.get("message", "Group successfully created"),
+                "group_name": group_name,
+                "created_in_keycloak": result.get("created_in_keycloak", False),
+                "created_in_scopes": result.get("created_in_scopes", False)
+            }
+        else:
+            error_detail = f"HTTP {response.status_code}: {response.text}"
+            logger.error(f"Failed to create group {group_name}: {error_detail}")
+            return {
+                "success": False,
+                "error": error_detail,
+                "status_code": response.status_code
+            }
+
+    except Exception as e:
+        error_msg = f"Error creating group {group_name}: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return {
+            "success": False,
+            "error": error_msg
+        }
+
+
+@mcp.tool()
+async def delete_group(
+    group_name: str = Field(..., description="Name of the group to delete"),
+    ctx: Context = None
+) -> Dict[str, Any]:
+    """
+    Delete a group from both Keycloak and scopes.yml.
+
+    This tool removes an access control group from the system. It deletes the
+    group from both Keycloak and scopes.yml, and removes it from group_mappings.
+    System groups cannot be deleted.
+
+    Args:
+        group_name: Name of the group to delete
+
+    Returns:
+        Dict with success status and deletion details
+
+    Example:
+        delete_group(group_name="mcp-servers-finance/read")
+    """
+    logger.info(f"delete_group called with group_name={group_name}")
+
+    try:
+        # Get admin credentials
+        registry_admin_user = os.environ.get("REGISTRY_USERNAME", "admin")
+        registry_admin_password = os.environ.get("REGISTRY_PASSWORD")
+
+        if not registry_admin_password:
+            error_msg = "REGISTRY_PASSWORD environment variable not set. Cannot authenticate to internal API."
+            logger.error(error_msg)
+            return {"success": False, "error": error_msg}
+
+        # Prepare the request data
+        form_data = {
+            "group_name": group_name
+        }
+
+        # Prepare Basic Auth header
+        import base64
+        credentials = f"{registry_admin_user}:{registry_admin_password}"
+        encoded_credentials = base64.b64encode(credentials.encode()).decode()
+        headers = {
+            "Authorization": f"Basic {encoded_credentials}",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+
+        # Make request to internal API
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{REGISTRY_BASE_URL}/api/internal/delete-group",
+                data=form_data,
+                headers=headers,
+                timeout=30.0
+            )
+
+        if response.status_code == 200:
+            result = response.json()
+            logger.info(f"Successfully deleted group {group_name}")
+            return {
+                "success": True,
+                "message": result.get("message", "Group successfully deleted"),
+                "group_name": group_name,
+                "deleted_from_keycloak": result.get("deleted_from_keycloak", False),
+                "deleted_from_scopes": result.get("deleted_from_scopes", False)
+            }
+        else:
+            error_detail = f"HTTP {response.status_code}: {response.text}"
+            logger.error(f"Failed to delete group {group_name}: {error_detail}")
+            return {
+                "success": False,
+                "error": error_detail,
+                "status_code": response.status_code
+            }
+
+    except Exception as e:
+        error_msg = f"Error deleting group {group_name}: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return {
+            "success": False,
+            "error": error_msg
+        }
+
+
+@mcp.tool()
+async def list_groups(ctx: Context = None) -> Dict[str, Any]:
+    """
+    List all groups from Keycloak and scopes.yml with synchronization status.
+
+    This tool provides a comprehensive view of all access control groups in the
+    system, showing which groups exist in Keycloak, scopes.yml, or both. It also
+    identifies groups that are out of sync between the two systems.
+
+    Returns:
+        Dict containing:
+        - keycloak_groups: List of groups in Keycloak
+        - scopes_groups: Dict of groups in scopes.yml with server counts
+        - synchronized: List of groups in both systems
+        - keycloak_only: List of groups only in Keycloak
+        - scopes_only: List of groups only in scopes.yml
+        - summary: Statistics about group counts
+
+    Example:
+        list_groups()
+    """
+    logger.info("list_groups called")
+
+    try:
+        # Get admin credentials
+        registry_admin_user = os.environ.get("REGISTRY_USERNAME", "admin")
+        registry_admin_password = os.environ.get("REGISTRY_PASSWORD")
+
+        if not registry_admin_password:
+            error_msg = "REGISTRY_PASSWORD environment variable not set. Cannot authenticate to internal API."
+            logger.error(error_msg)
+            return {"success": False, "error": error_msg}
+
+        # Prepare Basic Auth header
+        import base64
+        credentials = f"{registry_admin_user}:{registry_admin_password}"
+        encoded_credentials = base64.b64encode(credentials.encode()).decode()
+        headers = {
+            "Authorization": f"Basic {encoded_credentials}"
+        }
+
+        # Make request to internal API
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{REGISTRY_BASE_URL}/api/internal/list-groups",
+                headers=headers,
+                timeout=30.0
+            )
+
+        if response.status_code == 200:
+            result = response.json()
+            logger.info("Successfully listed groups")
+
+            # Add success flag
+            result["success"] = True
+
+            # Calculate summary stats
+            result["summary"] = {
+                "total_keycloak": len(result.get("keycloak_groups", [])),
+                "total_scopes": len(result.get("scopes_groups", {})),
+                "synchronized_count": len(result.get("synchronized", [])),
+                "keycloak_only_count": len(result.get("keycloak_only", [])),
+                "scopes_only_count": len(result.get("scopes_only", []))
+            }
+
+            return result
+        else:
+            error_detail = f"HTTP {response.status_code}: {response.text}"
+            logger.error(f"Failed to list groups: {error_detail}")
+            return {
+                "success": False,
+                "error": error_detail,
+                "status_code": response.status_code
+            }
+
+    except Exception as e:
+        error_msg = f"Error listing groups: {str(e)}"
         logger.error(error_msg, exc_info=True)
         return {
             "success": False,

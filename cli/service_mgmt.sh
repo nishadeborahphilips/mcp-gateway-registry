@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Service Management Script for MCP Gateway Registry
-# Usage: ./cli/service_mgmt.sh {add|delete|monitor} [service_name]
+# Usage: ./cli/service_mgmt.sh {add|delete|monitor|test|add-to-groups|remove-from-groups|create-group|delete-group|list-groups} [args...]
 
 set -e
 
@@ -106,7 +106,7 @@ verify_scopes_yml() {
 
     # Check container scopes.yml
     local container_count
-    container_count=$(docker exec mcp-gateway-registry_auth-server_1 grep -c "$service_name" /app/scopes.yml 2>/dev/null || echo "0")
+    container_count=$(docker exec mcp-gateway-registry-auth-server-1 grep -c "$service_name" /app/scopes.yml 2>/dev/null || echo "0")
     # Ensure we only get the last line if multiple lines are returned
     container_count=$(echo "$container_count" | tail -1)
 
@@ -125,7 +125,7 @@ verify_scopes_yml() {
 
     # Check host scopes.yml
     local host_count
-    host_count=$(grep -c "$service_name" /opt/mcp-gateway/auth_server/scopes.yml 2>/dev/null || echo "0")
+    host_count=$(grep -c "$service_name" "${HOME}/mcp-gateway/auth_server/scopes.yml" 2>/dev/null || echo "0")
     # Ensure we only get the last line if multiple lines are returned
     host_count=$(echo "$host_count" | tail -1)
 
@@ -150,7 +150,7 @@ verify_faiss_metadata() {
     print_info "Checking FAISS index metadata..."
 
     local metadata_count
-    metadata_count=$(docker exec mcp-gateway-registry_registry_1 grep -c "$service_name" /app/registry/servers/service_index_metadata.json 2>/dev/null || echo "0")
+    metadata_count=$(docker exec mcp-gateway-registry-registry-1 grep -c "$service_name" /app/registry/servers/service_index_metadata.json 2>/dev/null || echo "0")
     # Ensure we only get the last line if multiple lines are returned
     metadata_count=$(echo "$metadata_count" | tail -1)
 
@@ -320,6 +320,29 @@ try:
         print(f'ERROR: Missing required fields in config: {missing_fields}')
         sys.exit(1)
 
+    # Handle bedrock-agentcore specific URL formatting
+    auth_provider = config.get('auth_provider', '')
+    if auth_provider == 'bedrock-agentcore':
+        # Ensure path begins and ends with '/'
+        path = config['path']
+        if not path.startswith('/'):
+            path = '/' + path
+        if not path.endswith('/'):
+            path = path + '/'
+        config['path'] = path
+
+        # Ensure proxy_pass_url ends with '/' and does not have '/mcp' or '/mcp/' at the end
+        proxy_url = config['proxy_pass_url']
+        # Remove trailing '/mcp/' or '/mcp'
+        if proxy_url.endswith('/mcp/'):
+            proxy_url = proxy_url[:-5]  # Remove '/mcp/'
+        elif proxy_url.endswith('/mcp'):
+            proxy_url = proxy_url[:-4]  # Remove '/mcp'
+        # Ensure it ends with '/'
+        if not proxy_url.endswith('/'):
+            proxy_url = proxy_url + '/'
+        config['proxy_pass_url'] = proxy_url
+
     # Validate field types and constraints
     errors = []
 
@@ -342,7 +365,7 @@ try:
         errors.append('proxy_pass_url must start with http:// or https://')
 
     # Check for unknown fields (not part of tool spec)
-    allowed_fields = {'server_name', 'path', 'proxy_pass_url', 'description', 'tags', 'num_tools', 'num_stars', 'is_python', 'license'}
+    allowed_fields = {'server_name', 'path', 'proxy_pass_url', 'description', 'tags', 'num_tools', 'num_stars', 'is_python', 'license', 'auth_provider', 'auth_type', 'supported_transports', 'headers', 'tool_list'}
     unknown_fields = set(config.keys()) - allowed_fields
     if unknown_fields:
         errors.append(f'Unknown fields not allowed by register_service tool spec: {sorted(unknown_fields)}')
@@ -381,7 +404,12 @@ try:
         sys.exit(1)
 
     # Extract service name from path for validation
-    service_name = config['path'].lstrip('/')
+    service_name = config['path'].lstrip('/').rstrip('/')
+
+    # Output both the modified config and service name
+    # First line: modified config as JSON
+    # Second line: service name
+    print(json.dumps(config))
     print(service_name)
 
 except json.JSONDecodeError as e:
@@ -413,12 +441,19 @@ add_service() {
     config_json="$(cat "$config_file")"
 
     # Validate config and extract service name
-    local service_name
-    if ! service_name=$(validate_config "$config_json"); then
+    local validation_output service_name modified_config
+    if ! validation_output=$(validate_config "$config_json"); then
         print_error "Config validation failed"
-        echo "$service_name"  # This contains error message
+        echo "$validation_output"  # This contains error message
         exit 1
     fi
+
+    # Parse the two-line output: first line is modified config, second is service name
+    modified_config=$(echo "$validation_output" | head -n 1)
+    service_name=$(echo "$validation_output" | tail -n 1)
+
+    # Use the modified config for registration
+    config_json="$modified_config"
 
     echo "=== Adding Service: $service_name ==="
 
@@ -477,12 +512,19 @@ delete_service() {
     config_json="$(cat "$config_file")"
 
     # Validate config and extract service info
-    local service_name
-    if ! service_name=$(validate_config "$config_json"); then
+    local validation_output service_name modified_config
+    if ! validation_output=$(validate_config "$config_json"); then
         print_error "Config validation failed"
-        echo "$service_name"  # This contains error message
+        echo "$validation_output"  # This contains error message
         exit 1
     fi
+
+    # Parse the two-line output: first line is modified config, second is service name
+    modified_config=$(echo "$validation_output" | head -n 1)
+    service_name=$(echo "$validation_output" | tail -n 1)
+
+    # Use the modified config
+    config_json="$modified_config"
 
     # Extract service path from config
     local service_path
@@ -542,12 +584,19 @@ test_service() {
     config_json="$(cat "$config_file")"
 
     # Validate config and extract service info
-    local service_name
-    if ! service_name=$(validate_config "$config_json"); then
+    local validation_output service_name modified_config
+    if ! validation_output=$(validate_config "$config_json"); then
         print_error "Config validation failed"
-        echo "$service_name"  # This contains error message
+        echo "$validation_output"  # This contains error message
         exit 1
     fi
+
+    # Parse the two-line output: first line is modified config, second is service name
+    modified_config=$(echo "$validation_output" | head -n 1)
+    service_name=$(echo "$validation_output" | tail -n 1)
+
+    # Use the modified config
+    config_json="$modified_config"
 
     # Extract description and tags for testing
     local description tags_json
@@ -621,12 +670,16 @@ monitor_services() {
         config_json="$(cat "$config_file")"
 
         # Validate config and extract service name
-        service_name=$(validate_config "$config_json")
-        if [ $? -ne 0 ]; then
+        local validation_output modified_config
+        if ! validation_output=$(validate_config "$config_json"); then
             print_error "Config validation failed"
-            echo "$service_name"  # This contains error message
+            echo "$validation_output"  # This contains error message
             exit 1
         fi
+
+        # Parse the two-line output: first line is modified config, second is service name
+        modified_config=$(echo "$validation_output" | head -n 1)
+        service_name=$(echo "$validation_output" | tail -n 1)
 
         echo "=== Monitoring Service: $service_name ==="
     else
@@ -646,19 +699,27 @@ monitor_services() {
 }
 
 show_usage() {
-    echo "Usage: $0 {add|delete|monitor|test|add-to-groups|remove-from-groups} [config-file] [groups]"
+    echo "Usage: $0 {add|delete|monitor|test|add-to-groups|remove-from-groups|create-group|delete-group|list-groups} [args...]"
     echo ""
-    echo "Commands:"
+    echo "Service Commands:"
     echo "  add <config-file>            - Add a service using JSON config and verify registration"
     echo "  delete <config-file>         - Delete a service using JSON config and verify removal"
     echo "  monitor [config-file]        - Run health check (all services or specific service from config)"
     echo "  test <config-file>           - Test service searchability using intelligent_tool_finder"
+    echo ""
+    echo "Server-to-Group Commands:"
     echo "  add-to-groups <server-name> <groups> - Add server to specific scopes groups (comma-separated)"
     echo "  remove-from-groups <server-name> <groups> - Remove server from specific scopes groups (comma-separated)"
     echo ""
+    echo "Group Management Commands:"
+    echo "  create-group <group-name> [description] - Create a new group in Keycloak and scopes.yml"
+    echo "  delete-group <group-name>    - Delete a group from Keycloak and scopes.yml"
+    echo "  list-groups                  - List all groups with synchronization status"
+    echo ""
     echo "Config File Requirements:"
     echo "  Required fields: server_name, path, proxy_pass_url"
-    echo "  Optional fields: description, tags, num_tools, num_stars, is_python, license"
+    echo "  Optional fields: description, tags, num_tools, num_stars, is_python, license,"
+    echo "                   auth_provider, auth_type, supported_transports, headers, tool_list"
     echo "  Constraints:"
     echo "    - path must start with '/' and be more than just '/'"
     echo "    - proxy_pass_url must start with http:// or https://"
@@ -666,15 +727,26 @@ show_usage() {
     echo "    - tags must be array of strings"
     echo "    - num_tools/num_stars must be non-negative integers"
     echo "    - is_python must be boolean"
+    echo "    - supported_transports must be array of strings"
+    echo "    - headers must be array of objects"
+    echo "    - tool_list must be array of objects"
     echo ""
     echo "Examples:"
+    echo "  # Service operations"
     echo "  $0 add cli/examples/example-server-config.json"
     echo "  $0 delete cli/examples/example-server-config.json"
     echo "  $0 monitor                                        # All services"
     echo "  $0 monitor cli/examples/example-server-config.json # Specific service"
     echo "  $0 test cli/examples/example-server-config.json    # Test searchability"
+    echo ""
+    echo "  # Server-to-group operations"
     echo "  $0 add-to-groups example-server 'mcp-servers-restricted/read,mcp-servers-restricted/execute'"
     echo "  $0 remove-from-groups example-server 'mcp-servers-restricted/read,mcp-servers-restricted/execute'"
+    echo ""
+    echo "  # Group management operations"
+    echo "  $0 create-group mcp-servers-finance/read 'Finance team read access'"
+    echo "  $0 delete-group mcp-servers-finance/read"
+    echo "  $0 list-groups"
 }
 
 add_to_groups() {
@@ -795,6 +867,134 @@ remove_from_groups() {
     print_success "Remove from groups operation completed!"
 }
 
+
+create_group() {
+    local group_name="$1"
+    local description="${2:-}"
+
+    if [ -z "$group_name" ]; then
+        print_error "Group name is required"
+        echo "Usage: $0 create-group <group-name> [description]"
+        exit 1
+    fi
+
+    echo "=== Creating Group: $group_name ==="
+
+    # Check prerequisites
+    check_prerequisites
+
+    # Prepare arguments for create_group MCP tool
+    local args="{\"group_name\": \"$group_name\""
+    if [ -n "$description" ]; then
+        # Escape description for JSON
+        local escaped_desc=$(echo "$description" | sed 's/"/\\"/g')
+        args="$args, \"description\": \"$escaped_desc\""
+    fi
+    args="$args}"
+
+    # Call create_group MCP tool
+    if ! run_mcp_command "create_group" "$args" "Creating group '$group_name'"; then
+        print_error "Failed to create group"
+        exit 1
+    fi
+
+    # Verify in scopes.yml (container)
+    print_info "Verifying group in container scopes.yml..."
+    if docker exec mcp-gateway-registry-auth-server-1 cat /app/scopes.yml | grep -q "^$group_name:"; then
+        print_success "Group found in container scopes.yml"
+    else
+        print_error "Group NOT found in container scopes.yml"
+    fi
+
+    # Verify in scopes.yml (host)
+    local host_scopes_file="$HOME/mcp-gateway/auth_server/scopes.yml"
+    if [ -f "$host_scopes_file" ]; then
+        print_info "Verifying group in host scopes.yml..."
+        if grep -q "^$group_name:" "$host_scopes_file"; then
+            print_success "Group found in host scopes.yml"
+        else
+            print_error "Group NOT found in host scopes.yml"
+        fi
+    fi
+
+    echo ""
+    print_success "Create group operation completed!"
+}
+
+
+delete_group() {
+    local group_name="$1"
+
+    if [ -z "$group_name" ]; then
+        print_error "Group name is required"
+        echo "Usage: $0 delete-group <group-name>"
+        exit 1
+    fi
+
+    echo "=== Deleting Group: $group_name ==="
+
+    # Check prerequisites
+    check_prerequisites
+
+    # Prepare arguments for delete_group MCP tool
+    local args="{\"group_name\": \"$group_name\"}"
+
+    # Call delete_group MCP tool
+    if ! run_mcp_command "delete_group" "$args" "Deleting group '$group_name'"; then
+        print_error "Failed to delete group"
+        exit 1
+    fi
+
+    # Verify removal from scopes.yml (container)
+    print_info "Verifying group removal from container scopes.yml..."
+    if docker exec mcp-gateway-registry-auth-server-1 cat /app/scopes.yml | grep -q "^$group_name:"; then
+        print_error "Group still found in container scopes.yml"
+    else
+        print_success "Group removed from container scopes.yml"
+    fi
+
+    # Verify removal from scopes.yml (host)
+    local host_scopes_file="$HOME/mcp-gateway/auth_server/scopes.yml"
+    if [ -f "$host_scopes_file" ]; then
+        print_info "Verifying group removal from host scopes.yml..."
+        if grep -q "^$group_name:" "$host_scopes_file"; then
+            print_error "Group still found in host scopes.yml"
+        else
+            print_success "Group removed from host scopes.yml"
+        fi
+    fi
+
+    echo ""
+    print_success "Delete group operation completed!"
+}
+
+
+list_groups() {
+    echo "=== Listing All Groups ==="
+
+    # Check prerequisites
+    check_prerequisites
+
+    # Call list_groups MCP tool
+    local args="{}"
+
+    print_info "Fetching groups from Keycloak and scopes.yml..."
+
+    if output=$(cd "$PROJECT_ROOT" && uv run cli/mcp_client.py --url http://localhost/mcpgw/mcp call --tool list_groups --args "$args" 2>&1); then
+        print_success "Groups retrieved successfully"
+        echo ""
+        echo "$output"
+    else
+        print_error "Failed to list groups"
+        echo "$output"
+        exit 1
+    fi
+
+    echo ""
+    print_success "List groups operation completed!"
+}
+
+
 # Main script logic
 case "${1:-}" in
     add)
@@ -814,6 +1014,15 @@ case "${1:-}" in
         ;;
     remove-from-groups)
         remove_from_groups "$2" "$3"
+        ;;
+    create-group)
+        create_group "$2" "$3"
+        ;;
+    delete-group)
+        delete_group "$2"
+        ;;
+    list-groups)
+        list_groups
         ;;
     *)
         show_usage

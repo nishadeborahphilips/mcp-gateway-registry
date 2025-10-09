@@ -363,6 +363,11 @@ async def internal_register_service(
     is_python: Annotated[bool, Form()] = False,
     license_str: Annotated[str, Form(alias="license")] = "N/A",
     overwrite: Annotated[bool, Form()] = True,
+    auth_provider: Annotated[str | None, Form()] = None,
+    auth_type: Annotated[str | None, Form()] = None,
+    supported_transports: Annotated[str | None, Form()] = None,
+    headers: Annotated[str | None, Form()] = None,
+    tool_list_json: Annotated[str | None, Form()] = None,
 ):
     """Internal service registration endpoint for mcpgw-server (requires HTTP Basic Authentication with admin credentials)."""
     logger.warning("INTERNAL REGISTER: Function called - starting execution")  # TODO: replace with debug
@@ -436,21 +441,53 @@ async def internal_register_service(
     tag_list = [tag.strip() for tag in tags.split(',') if tag.strip()] if tags else []
     logger.warning(f"INTERNAL REGISTER: Processed tags: {tag_list}")  # TODO: replace with debug
 
+    # Process supported_transports
+    if supported_transports:
+        try:
+            transports_list = json.loads(supported_transports) if supported_transports.startswith('[') else [t.strip() for t in supported_transports.split(',')]
+        except Exception as e:
+            logger.warning(f"INTERNAL REGISTER: Failed to parse supported_transports, using default: {e}")
+            transports_list = ["streamable-http"]
+    else:
+        transports_list = ["streamable-http"]
+
+    # Process headers
+    headers_list = []
+    if headers:
+        try:
+            headers_list = json.loads(headers) if isinstance(headers, str) else headers
+        except Exception as e:
+            logger.warning(f"INTERNAL REGISTER: Failed to parse headers: {e}")
+
+    # Process tool_list
+    tool_list = []
+    if tool_list_json:
+        try:
+            tool_list = json.loads(tool_list_json) if isinstance(tool_list_json, str) else tool_list_json
+        except Exception as e:
+            logger.warning(f"INTERNAL REGISTER: Failed to parse tool_list_json: {e}")
+
     # Create server entry
     server_entry = {
         "server_name": name,
         "description": description,
         "path": path,
         "proxy_pass_url": proxy_pass_url,
-        "supported_transports": ["streamable-http"],  # Default transport
-        "auth_type": "none",  # Default auth type
+        "supported_transports": transports_list,
+        "auth_type": auth_type if auth_type else "none",
         "tags": tag_list,
         "num_tools": num_tools,
         "num_stars": num_stars,
         "is_python": is_python,
         "license": license_str,
-        "tool_list": []  # Will be populated by health checks
+        "tool_list": tool_list
     }
+
+    # Add optional fields if provided
+    if auth_provider:
+        server_entry["auth_provider"] = auth_provider
+    if headers_list:
+        server_entry["headers"] = headers_list
 
     logger.warning(f"INTERNAL REGISTER: Created server entry: {server_entry}")  # TODO: replace with debug
     logger.warning(f"INTERNAL REGISTER: Overwrite parameter: {overwrite}")  # TODO: replace with debug
@@ -1168,44 +1205,54 @@ async def get_service_tools(
         raise HTTPException(status_code=500, detail="Service has no proxy URL configured")
 
     logger.info(f"Fetching live tools for {service_path} from {proxy_pass_url}")
-    
+
     try:
         # Call MCP client to fetch fresh tools using server configuration
         tool_list = await mcp_client_service.get_tools_from_server_with_server_info(proxy_pass_url, server_info)
-        
+
         if tool_list is None:
+            # If live fetch fails but we have cached tools, use those
+            cached_tools = server_info.get("tool_list")
+            if cached_tools is not None and isinstance(cached_tools, list):
+                logger.warning(f"Failed to fetch live tools for {service_path}, using cached tools")
+                return {"service_path": service_path, "tools": cached_tools, "cached": True}
             raise HTTPException(status_code=503, detail="Failed to fetch tools from MCP server. Service may be unhealthy.")
-        
+
         # Update the server registry with the fresh tools
         new_tool_count = len(tool_list)
         current_tool_count = server_info.get("num_tools", 0)
-        
+
         if current_tool_count != new_tool_count or server_info.get("tool_list") != tool_list:
             logger.info(f"Updating tool list for {service_path}. New count: {new_tool_count}")
-            
+
             # Update server info with fresh tools
             updated_server_info = server_info.copy()
             updated_server_info["tool_list"] = tool_list
             updated_server_info["num_tools"] = new_tool_count
-            
-            # Save updated server info 
+
+            # Save updated server info
             success = server_service.update_server(service_path, updated_server_info)
             if success:
                 logger.info(f"Successfully updated tool list for {service_path}")
-                
+
                 # Update FAISS index with new tool data
                 await faiss_service.add_or_update_service(service_path, updated_server_info, is_enabled)
                 logger.info(f"Updated FAISS index for {service_path}")
             else:
                 logger.error(f"Failed to save updated tool list for {service_path}")
-        
-        return {"service_path": service_path, "tools": tool_list}
-        
+
+        return {"service_path": service_path, "tools": tool_list, "cached": False}
+
     except HTTPException:
         # Re-raise HTTP exceptions as-is
         raise
     except Exception as e:
         logger.error(f"Error fetching tools for {service_path}: {e}")
+        # Try to return cached tools if available
+        cached_tools = server_info.get("tool_list")
+        if cached_tools is not None and isinstance(cached_tools, list):
+            logger.warning(f"Error fetching live tools for {service_path}, falling back to cached tools: {e}")
+            return {"service_path": service_path, "tools": cached_tools, "cached": True}
         raise HTTPException(status_code=500, detail=f"Error fetching tools: {str(e)}")
 
 
@@ -1567,6 +1614,346 @@ async def internal_list_services(
             "total_count": len(services)
         },
     )
+
+
+@router.post("/internal/create-group")
+async def internal_create_group(
+    request: Request,
+    group_name: Annotated[str, Form()],
+    description: Annotated[str, Form()] = "",
+    create_in_keycloak: Annotated[bool, Form()] = True,
+):
+    """Internal endpoint to create a new group in both Keycloak and scopes.yml (requires HTTP Basic Authentication with admin credentials)."""
+    import base64
+    import os
+    from ..utils.scopes_manager import create_group_in_scopes
+    from ..utils.keycloak_manager import create_keycloak_group, group_exists_in_keycloak
+
+    # Extract and validate Basic Auth
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Basic "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid authorization header",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    try:
+        credentials = base64.b64decode(auth_header[6:]).decode("utf-8")
+        username, password = credentials.split(":", 1)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authorization header format",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    admin_user = os.environ.get("ADMIN_USER", "admin")
+    admin_password = os.environ.get("ADMIN_PASSWORD")
+
+    if not admin_password:
+        logger.error("ADMIN_PASSWORD environment variable not set for internal create-group")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server configuration error"
+        )
+
+    if username != admin_user or password != admin_password:
+        logger.warning(f"Failed admin authentication attempt for internal create-group from {username}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid admin credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    # Validate group name
+    if not group_name or not group_name.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Group name is required"
+        )
+
+    logger.info(f"Creating group '{group_name}' via internal endpoint by admin '{username}'")
+
+    try:
+        # Create in Keycloak first if requested
+        keycloak_created = False
+        if create_in_keycloak:
+            try:
+                # Check if group already exists in Keycloak
+                if await group_exists_in_keycloak(group_name):
+                    logger.warning(f"Group '{group_name}' already exists in Keycloak")
+                else:
+                    await create_keycloak_group(group_name, description)
+                    keycloak_created = True
+                    logger.info(f"Group '{group_name}' created in Keycloak")
+            except Exception as e:
+                logger.error(f"Failed to create group in Keycloak: {e}")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Failed to create group in Keycloak: {str(e)}"
+                )
+
+        # Create in scopes.yml
+        scopes_success = await create_group_in_scopes(group_name, description)
+
+        if scopes_success:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "message": "Group successfully created",
+                    "group_name": group_name,
+                    "created_in_keycloak": keycloak_created,
+                    "created_in_scopes": True
+                }
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Failed to create group in scopes.yml (may already exist)"
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating group '{group_name}': {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal error: {str(e)}"
+        )
+
+
+@router.post("/internal/delete-group")
+async def internal_delete_group(
+    request: Request,
+    group_name: Annotated[str, Form()],
+    delete_from_keycloak: Annotated[bool, Form()] = True,
+    force: Annotated[bool, Form()] = False,
+):
+    """Internal endpoint to delete a group from both Keycloak and scopes.yml (requires HTTP Basic Authentication with admin credentials)."""
+    import base64
+    import os
+    from ..utils.scopes_manager import delete_group_from_scopes
+    from ..utils.keycloak_manager import delete_keycloak_group, group_exists_in_keycloak
+
+    # Extract and validate Basic Auth
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Basic "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid authorization header",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    try:
+        credentials = base64.b64decode(auth_header[6:]).decode("utf-8")
+        username, password = credentials.split(":", 1)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authorization header format",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    admin_user = os.environ.get("ADMIN_USER", "admin")
+    admin_password = os.environ.get("ADMIN_PASSWORD")
+
+    if not admin_password:
+        logger.error("ADMIN_PASSWORD environment variable not set for internal delete-group")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server configuration error"
+        )
+
+    if username != admin_user or password != admin_password:
+        logger.warning(f"Failed admin authentication attempt for internal delete-group from {username}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid admin credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    # Validate group name
+    if not group_name or not group_name.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Group name is required"
+        )
+
+    # Prevent deletion of system groups
+    system_groups = [
+        "UI-Scopes",
+        "group_mappings",
+        "mcp-registry-admin",
+        "mcp-registry-user",
+        "mcp-registry-developer",
+        "mcp-registry-operator"
+    ]
+
+    if group_name in system_groups:
+        logger.warning(f"Attempt to delete system group '{group_name}' by admin '{username}'")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Cannot delete system group '{group_name}'"
+        )
+
+    logger.info(f"Deleting group '{group_name}' via internal endpoint by admin '{username}'")
+
+    try:
+        # Delete from scopes.yml first
+        scopes_success = await delete_group_from_scopes(group_name, remove_from_mappings=True)
+
+        if not scopes_success:
+            logger.warning(f"Group '{group_name}' not found in scopes.yml or deletion failed")
+
+        # Delete from Keycloak if requested
+        keycloak_deleted = False
+        if delete_from_keycloak:
+            try:
+                if await group_exists_in_keycloak(group_name):
+                    await delete_keycloak_group(group_name)
+                    keycloak_deleted = True
+                    logger.info(f"Group '{group_name}' deleted from Keycloak")
+                else:
+                    logger.warning(f"Group '{group_name}' not found in Keycloak")
+            except Exception as e:
+                logger.error(f"Failed to delete group from Keycloak: {e}")
+                # Continue anyway - scopes deletion might have succeeded
+
+        if scopes_success or keycloak_deleted:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "message": "Group deletion completed",
+                    "group_name": group_name,
+                    "deleted_from_keycloak": keycloak_deleted,
+                    "deleted_from_scopes": scopes_success
+                }
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Group '{group_name}' not found in either Keycloak or scopes.yml"
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting group '{group_name}': {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal error: {str(e)}"
+        )
+
+
+@router.get("/internal/list-groups")
+async def internal_list_groups(
+    request: Request,
+    include_keycloak: bool = True,
+    include_scopes: bool = True,
+):
+    """Internal endpoint to list groups from Keycloak and/or scopes.yml (requires HTTP Basic Authentication with admin credentials)."""
+    import base64
+    import os
+    from ..utils.scopes_manager import list_groups_from_scopes
+    from ..utils.keycloak_manager import list_keycloak_groups
+
+    # Extract and validate Basic Auth
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Basic "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid authorization header",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    try:
+        credentials = base64.b64decode(auth_header[6:]).decode("utf-8")
+        username, password = credentials.split(":", 1)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authorization header format",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    admin_user = os.environ.get("ADMIN_USER", "admin")
+    admin_password = os.environ.get("ADMIN_PASSWORD")
+
+    if not admin_password:
+        logger.error("ADMIN_PASSWORD environment variable not set for internal list-groups")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server configuration error"
+        )
+
+    if username != admin_user or password != admin_password:
+        logger.warning(f"Failed admin authentication attempt for internal list-groups from {username}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid admin credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    logger.info(f"Listing groups via internal endpoint by admin '{username}'")
+
+    try:
+        result = {
+            "keycloak_groups": [],
+            "scopes_groups": {},
+            "synchronized": [],
+            "keycloak_only": [],
+            "scopes_only": []
+        }
+
+        # Get groups from Keycloak
+        keycloak_group_names = set()
+        if include_keycloak:
+            try:
+                keycloak_groups = await list_keycloak_groups()
+                result["keycloak_groups"] = [
+                    {
+                        "name": group.get("name"),
+                        "id": group.get("id"),
+                        "path": group.get("path", "")
+                    }
+                    for group in keycloak_groups
+                ]
+                keycloak_group_names = {group.get("name") for group in keycloak_groups}
+                logger.info(f"Found {len(keycloak_groups)} groups in Keycloak")
+            except Exception as e:
+                logger.error(f"Failed to list Keycloak groups: {e}")
+                result["keycloak_error"] = str(e)
+
+        # Get groups from scopes.yml
+        scopes_group_names = set()
+        if include_scopes:
+            try:
+                scopes_data = await list_groups_from_scopes()
+                result["scopes_groups"] = scopes_data.get("groups", {})
+                scopes_group_names = set(scopes_data.get("groups", {}).keys())
+                logger.info(f"Found {len(scopes_group_names)} groups in scopes.yml")
+            except Exception as e:
+                logger.error(f"Failed to list scopes groups: {e}")
+                result["scopes_error"] = str(e)
+
+        # Find synchronized and out-of-sync groups
+        if include_keycloak and include_scopes:
+            result["synchronized"] = list(keycloak_group_names & scopes_group_names)
+            result["keycloak_only"] = list(keycloak_group_names - scopes_group_names)
+            result["scopes_only"] = list(scopes_group_names - keycloak_group_names)
+
+        return JSONResponse(
+            status_code=200,
+            content=result
+        )
+
+    except Exception as e:
+        logger.error(f"Error listing groups: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal error: {str(e)}"
+        )
 
 
 @router.post("/tokens/generate")
